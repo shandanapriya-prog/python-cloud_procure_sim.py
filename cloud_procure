@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+"""
+cloud_procure_sim.py
+
+Mini-project: discrete-event simulator for a Cloud Procurement Lifecycle.
+
+Usage:
+    python cloud_procure_sim.py           # runs default simulation
+    python cloud_procure_sim.py --demo    # runs a deterministic demo (seeded)
+    python cloud_procure_sim.py --n 200   # simulate 200 requests
+    python cloud_procure_sim.py --out results.csv
+
+Output:
+    - prints summary stats
+    - writes a CSV of all requests with timestamps and durations
+    - attempts to show simple charts if matplotlib is available
+"""
+
+import argparse
+import csv
+import heapq
+import math
+import random
+import statistics
+import sys
+import time
+from collections import namedtuple, defaultdict
+from datetime import datetime, timedelta
+
+# -------------------------
+# Configuration & Helpers
+# -------------------------
+STAGES = [
+    "CREATED",         # request generated
+    "APPROVED",        # manager/legal/finance approval
+    "VENDOR_SELECTED", # selection process done
+    "PO_ISSUED",       # purchase order sent
+    "PROVISIONED",     # vendor/cloud resources provisioned
+    "DEPLOYED",        # deployed into environment and validated
+    "BILLED",          # first bill recorded
+    "REVIEW",          # post-provision review/acceptance
+    "CLOSED"           # lifecycle closed (or marked for renewal)
+]
+
+Event = namedtuple("Event", ["time", "priority", "action", "entity_id", "meta"])
+# priority breaks ties; lower runs earlier.
+
+def sample_delay(stage, rng):
+    """Return a delay in hours for a given stage (could be tuned)."""
+    # Tuned example distributions (hours)
+    if stage == "APPROVED":
+        # approval often quick but can wait
+        return max(0.5, rng.gauss(12, 8))
+    if stage == "VENDOR_SELECTED":
+        return max(1, rng.gauss(24, 12))
+    if stage == "PO_ISSUED":
+        return max(1, rng.gauss(6, 3))
+    if stage == "PROVISIONED":
+        return max(0.25, rng.expovariate(1/4))  # mean 4 hours
+    if stage == "DEPLOYED":
+        return max(0.5, rng.gauss(6, 3))
+    if stage == "BILLED":
+        return max(24, rng.gauss(48, 24))  # first billing may take days
+    if stage == "REVIEW":
+        return max(1, rng.gauss(48, 24))
+    if stage == "CLOSED":
+        return 0
+    # default
+    return max(1, rng.gauss(8, 6))
+
+def stage_next_index(current_index):
+    return current_index + 1 if current_index + 1 < len(STAGES) else None
+
+# -------------------------
+# Procurement Request Entity
+# -------------------------
+class ProcRequest:
+    def __init__(self, id, created_time, spec, rng):
+        self.id = id
+        self.created_time = created_time
+        self.spec = spec  # dict e.g., {"type":"vm", "units":4}
+        self.rng = rng
+        self.stage_index = 0
+        self.timestamps = {STAGES[0]: created_time}
+        self.cost_estimate = self.estimate_cost()
+        # Some requests will fail at stages (simulate risk)
+        self.failed = False
+        self.failure_stage = None
+        self.final_cost = None
+        self.notes = ""
+
+    def estimate_cost(self):
+        # Very simple estimator: base price per unit * units * factor
+        base = {"vm": 0.05, "storage": 0.01, "db": 0.12}  # $/hour example
+        typ = self.spec.get("type", "vm")
+        units = self.spec.get("units", 1)
+        utilization = self.spec.get("util_pct", 0.6)
+        return base.get(typ, 0.05) * units * utilization
+
+    def advance_stage(self, sim_time):
+        if self.failed:
+            return None
+        cur_idx = self.stage_index
+        next_idx = stage_next_index(cur_idx)
+        if next_idx is None:
+            return None
+        self.stage_index = next_idx
+        stage_name = STAGES[self.stage_index]
+        self.timestamps[stage_name] = sim_time
+        return stage_name
+
+# -------------------------
+# Simulator
+# -------------------------
+class CloudProcureSimulator:
+    def __init__(self, rng_seed=None, verbose=False):
+        self.now = 0.0  # simulation time in hours since t0
+        self.event_queue = []
+        self.entities = {}
+        self.next_id = 1
+        self.rng = random.Random(rng_seed)
+        self.verbose = verbose
+        self.metrics = defaultdict(list)  # collects durations, costs, etc.
+
+    def schedule(self, delay_hours, action, entity_id=None, meta=None, priority=0):
+        event_time = self.now + delay_hours
+        heapq.heappush(self.event_queue, Event(event_time, priority, action, entity_id, meta))
+
+    def emit(self, msg):
+        if self.verbose:
+            print(f"[{self.now:.2f}h] {msg}")
+
+    def create_request(self, created_time_hours=None, spec=None):
+        created = created_time_hours if created_time_hours is not None else self.now
+        eid = f"REQ{self.next_id:04d}"
+        self.next_id += 1
+        if spec is None:
+            spec = self.random_spec()
+        req = ProcRequest(eid, created, spec, self.rng)
+        self.entities[eid] = req
+        # Schedule move from CREATED -> APPROVED
+        delay = sample_delay("APPROVED", self.rng)
+        self.schedule(delay, "advance_stage", entity_id=eid)
+        self.emit(f"Created {eid} spec={spec} est_cost/hr={req.cost_estimate:.4f}")
+        return eid
+
+    def random_spec(self):
+        types = ["vm", "storage", "db"]
+        typ = self.rng.choice(types)
+        units = max(1, int(abs(self.rng.gauss(4, 6))) or 1)
+        util = round(min(1.0, max(0.1, self.rng.random())), 2)
+        return {"type": typ, "units": units, "util_pct": util}
+
+    def run(self, until_hours=24*30, max_events=100000):
+        processed = 0
+        while self.event_queue and processed < max_events:
+            ev = heapq.heappop(self.event_queue)
+            # Advance time to event time
+            self.now = ev.time
+            processed += 1
+
+            if ev.action == "advance_stage":
+                self.handle_advance(ev.entity_id)
+            elif ev.action == "maybe_generate":
+                self.create_request(created_time_hours=self.now)
+                # reschedule generation
+                inter = max(0.1, self.rng.expovariate(1/6.0))  # on average one every 6 hours
+                self.schedule(inter, "maybe_generate")
+            else:
+                self.emit(f"Unknown action {ev.action}")
+
+            if self.now > until_hours:
+                break
+
+        # finalize metrics
+        self.collect_metrics()
+        return processed
+
+    def handle_advance(self, eid):
+        req = self.entities.get(eid)
+        if req is None:
+            return
+        cur_stage = STAGES[req.stage_index]
+        # Simulate chance of failure at some stages
+        fail_prob = 0.0
+        if cur_stage == "CREATED":
+            fail_prob = 0.01  # cancel by requester
+        elif cur_stage == "APPROVED":
+            fail_prob = 0.03  # denied
+        elif cur_stage == "VENDOR_SELECTED":
+            fail_prob = 0.02
+        elif cur_stage == "PROVISIONED":
+            fail_prob = 0.02  # provisioning failure
+        # random failure
+        if self.rng.random() < fail_prob:
+            req.failed = True
+            req.failure_stage = cur_stage
+            req.notes = "Failed during " + cur_stage
+            self.emit(f"{eid} failed at stage {cur_stage}")
+            # mark closed
+            req.timestamps["CLOSED"] = self.now
+            return
+
+        # advance to next
+        next_stage = req.advance_stage(self.now)
+        self.emit(f"{eid} -> {next_stage}")
+        # schedule next event for next stage
+        if next_stage == "VENDOR_SELECTED":
+            delay = sample_delay("VENDOR_SELECTED", self.rng)
+            # maybe longer for large requests
+            delay *= (1 + math.log(1 + req.spec["units"]))
+            self.schedule(delay, "advance_stage", entity_id=eid)
+        elif next_stage == "PO_ISSUED":
+            delay = sample_delay("PO_ISSUED", self.rng)
+            self.schedule(delay, "advance_stage", entity_id=eid)
+        elif next_stage == "PROVISIONED":
+            delay = sample_delay("PROVISIONED", self.rng)
+            # provisioning cost overhead may add
+            self.schedule(delay, "advance_stage", entity_id=eid)
+        elif next_stage == "DEPLOYED":
+            # small validation delay
+            delay = sample_delay("DEPLOYED", self.rng)
+            self.schedule(delay, "advance_stage", entity_id=eid)
+        elif next_stage == "BILLED":
+            delay = sample_delay("BILLED", self.rng)
+            # schedule a billing event and then review
+            self.schedule(delay, "advance_stage", entity_id=eid)
+        elif next_stage == "REVIEW":
+            delay = sample_delay("REVIEW", self.rng)
+            self.schedule(delay, "advance_stage", entity_id=eid)
+        elif next_stage == "CLOSED":
+            # finalize cost: estimate * runtime hours until closed (simulate small runtime)
+            runtime_hours = max(1.0, self.rng.gauss(24*7, 24*14))  # example: resources used for weeks
+            req.final_cost = req.cost_estimate * runtime_hours
+            req.timestamps["CLOSED"] = self.now
+            self.emit(f"{eid} closed. est_cost/hr={req.cost_estimate:.4f} final_cost={req.final_cost:.2f}")
+
+    def collect_metrics(self):
+        durations = []
+        closed = 0
+        failed = 0
+        costs = []
+        lead_times = []
+        for req in self.entities.values():
+            if req.failed:
+                failed += 1
+            if "CLOSED" in req.timestamps and "CREATED" in req.timestamps:
+                closed += 1
+                lead = req.timestamps["CLOSED"] - req.timestamps["CREATED"]
+                lead_times.append(lead)
+            if req.final_cost is not None:
+                costs.append(req.final_cost)
+        self.metrics["total_requests"] = len(self.entities)
+        self.metrics["closed"] = closed
+        self.metrics["failed"] = failed
+        self.metrics["avg_lead_hours"] = statistics.mean(lead_times) if lead_times else None
+        self.metrics["median_lead_hours"] = statistics.median(lead_times) if lead_times else None
+        self.metrics["avg_cost"] = statistics.mean(costs) if costs else None
+        self.metrics["median_cost"] = statistics.median(costs) if costs else None
+        self.metrics["lead_times"] = lead_times
+        self.metrics["costs"] = costs
+
+    def export_csv(self, path):
+        header = ["id", "type", "units", "created_h", "timestamps", "failed", "failure_stage", "final_cost", "notes"]
+        with open(path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for req in sorted(self.entities.values(), key=lambda r: r.created_time):
+                row = [
+                    req.id,
+                    req.spec.get("type"),
+                    req.spec.get("units"),
+                    f"{req.created_time:.2f}",
+                    "|".join(f"{k}:{req.timestamps.get(k,''):.2f}" if k in req.timestamps else f"{k}:" for k in STAGES),
+                    req.failed,
+                    req.failure_stage or "",
+                    f"{req.final_cost:.2f}" if req.final_cost is not None else "",
+                    req.notes
+                ]
+                w.writerow(row)
+
+# -------------------------
+# Runner / CLI
+# -------------------------
+def main(args):
+    sim = CloudProcureSimulator(rng_seed=(42 if args.demo else None), verbose=args.verbose)
+    # initial generation: schedule request arrivals (Poisson-ish)
+    # seed a few immediate requests
+    for _ in range(min(5, args.n)):
+        sim.create_request()
+    # schedule background generation
+    sim.schedule(0.5, "maybe_generate")  # start generating
+    # run simulation for configured horizon
+    start = time.time()
+    processed = sim.run(until_hours=args.horizon, max_events=1000000)
+    elapsed = time.time() - start
+    sim.export_csv(args.out)
+    # Summary
+    print("\n---- Simulation Summary ----")
+    print(f"Requests simulated: {sim.metrics['total_requests']}")
+    print(f"Closed: {sim.metrics['closed']}, Failed: {sim.metrics['failed']}")
+    if sim.metrics["avg_lead_hours"] is not None:
+        print(f"Avg lead time (hours): {sim.metrics['avg_lead_hours']:.2f}")
+        print(f"Median lead time (hours): {sim.metrics['median_lead_hours']:.2f}")
+    if sim.metrics["avg_cost"] is not None:
+        print(f"Avg final cost ($): {sim.metrics['avg_cost']:.2f}")
+        print(f"Median final cost ($): {sim.metrics['median_cost']:.2f}")
+    print(f"Events processed: {processed}, Sim time reached: {sim.now:.2f} hours, real elapsed {elapsed:.2f}s")
+    print(f"CSV written to: {args.out}")
+
+    # optional charts (if matplotlib available)
+    try:
+        import matplotlib.pyplot as plt
+        # lead times histogram
+        if sim.metrics["lead_times"]:
+            plt.figure(figsize=(8,4))
+            plt.hist(sim.metrics["lead_times"], bins=20)
+            plt.title("Lead times (hours)")
+            plt.xlabel("Hours")
+            plt.ylabel("Requests")
+            plt.tight_layout()
+            plt.show()
+        if sim.metrics["costs"]:
+            plt.figure(figsize=(8,4))
+            plt.hist(sim.metrics["costs"], bins=20)
+            plt.title("Final costs ($)")
+            plt.xlabel("Dollars")
+            plt.ylabel("Requests")
+            plt.tight_layout()
+            plt.show()
+    except Exception as e:
+        print("(Skipping charts — matplotlib not available or failed to display.)")
+
+if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="Cloud Procurement Lifecycle Simulator (mini-project)")
+    parser.add_argument("--n", type=int, default=50, help="initial number of requests to seed")
+    parser.add_argument("--horizon", type=float, default=24*30, help="simulation horizon in hours (default 30 days)")
+    parser.add_argument("--out", type=str, default="procure_results.csv", help="CSV output path")
+    parser.add_argument("--demo", action="store_true", help="use seeded RNG for deterministic demo")
+    parser.add_argument("--verbose", action="store_true", help="verbose logging")
+    args = parser.parse_args()
+    main(args)
